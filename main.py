@@ -7,10 +7,6 @@ Command: /addbot /removebot /listbot
 import httpx
 from bs4 import BeautifulSoup
 import re
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# REGEX CONFIGURATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_OTP_RE = re.compile(r"\b\d{3}[-\s]?\d{3}\b|\b\d{4,8}\b")
 from datetime import datetime
 import time
 import threading
@@ -327,20 +323,26 @@ def get_sms(acc, rng, number, _retry=0):
         return get_sms(acc, rng, number, _retry + 1)
     if r.status_code == 429 or "/login" in str(r.url):
         return []
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup      = BeautifulSoup(r.text, "html.parser")
     sms_texts = []
     try:
-        cells = soup.find_all(["td", "div"], class_=re.compile(r"message|sms", re.I)) or [soup]
-        for cell in cells:
-            text = cell.get_text(separator=" ").strip()
-            text = text.replace("<#>", "").strip()
-            if text and "No SMS Found" not in text:
-                sms_texts.append(text)
+        for t in soup.stripped_strings:
+            t = t.strip().replace("<#>", "").strip()
+            if re.fullmatch(r"[A-Za-z0-9]{10,}", t):
+                continue
+            t_low = t.lower()
+            if any(x in t_low for x in ["sender", "revenue", "time"]):
+                continue
+            if re.search(r"\b\d{2}:\d{2}:\d{2}\b", t):
+                continue
+            if "$" in t:
+                continue
+            if t and "No SMS Found" not in t:
+                sms_texts.append(t)
     except Exception as e:
         _log("SMS", f"parse error: {e}", Fore.RED)
     return list(dict.fromkeys(sms_texts))
     
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PLATFORM DETECTION
@@ -696,86 +698,83 @@ def tg_update_listener():
         except Exception as e:
             _log("CMD", f"listener error: {e}", Fore.YELLOW)
             time.sleep(5)
-            
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# OPTIMIZED WAITING / POLLING LOGIC (ANTI RATE-LIMIT)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-POLL_INTERVAL_MAX = 5.0  # Tambah jeda tunggu biar ga terlalu agresif
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# POLL ONE ACCOUNT
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_OTP_RE = re.compile(r"\b\d{3}[- ]?\d{3}\b")
 
 def poll_one(acc) -> bool:
-    found = False
+    found  = False
+    ranges = []
     try:
-        # Ambil range sekali
         ranges = get_ranges_cached(acc)
     except Exception as e:
         _log("RANGE", f"akun #{acc['idx']}: {e}", Fore.YELLOW)
         return False
 
+    def process_number(rng, num, fallback_country, code):
+        full_num = normalize_number(num, code)
+        if not full_num.isdigit():
+            return False
+
+        try:
+            sms_list = get_sms(acc, rng, num)
+        except Exception as e:
+            _log("SMS", f"akun #{acc['idx']}: {e}", Fore.YELLOW)
+            return False
+
+        local_found = False
+        for sms in sms_list:
+            clean = re.sub(r"\s+", " ", sms.replace("<#>", "")).strip()
+            uid   = hashlib.md5(f"{num}-{clean}".encode()).hexdigest()
+
+            with _sent_cache_lock:
+                if uid in sent_cache:
+                    continue
+
+            matches = _OTP_RE.findall(sms)
+            if not matches:
+                continue
+
+            otp                       = re.sub(r"[^0-9]", "", matches[0])
+            svc                       = detect_service(sms)
+            country, flag, region_code = detect_country_and_flag(full_num, fallback_country)
+            masked                    = mask_phone(full_num)
+
+            msg = build_otp_message(otp, svc, flag, country, region_code, masked)
+            tg_send_otp(otp, msg)
+            cache_add(uid)
+
+            _log(
+                "OTP",
+                f"{svc['icon']} {svc['name']:<10}  {flag} {region_code}  "
+                f"{masked}  →  {otp}",
+                Fore.GREEN,
+            )
+            local_found = True
+
+        return local_found
+
     for rng in ranges:
         fallback_country, code = parse_range(rng)
-
-        # Cek nomor
         try:
             numbers = get_numbers(acc, rng)
         except Exception as e:
             _log("NUM", f"akun #{acc['idx']}: {e}", Fore.YELLOW)
             continue
-
         if not numbers:
             continue
 
-        # Nunggu & cek SMS cuma untuk nomor yang ada
-        for num in numbers:
-            full_num = normalize_number(num, code)
-            if not full_num.isdigit():
-                continue
-
+        for n in numbers:
             try:
-                sms_list = get_sms(acc, rng, num)
+                if process_number(rng, n, fallback_country, code):
+                    found = True
             except Exception as e:
-                _log("SMS", f"akun #{acc['idx']}: {e}", Fore.YELLOW)
-                time.sleep(2.0)  # Kasih napas kalau error/limit
-                continue
-
-            for sms in sms_list:
-                clean = re.sub(r"\s+", " ", sms.replace("<#>", "")).strip()
-                uid = hashlib.md5(f"{num}-{clean}".encode()).hexdigest()
-
-                with _sent_cache_lock:
-                    if uid in sent_cache:
-                        continue
-
-                matches = _OTP_RE.findall(sms)
-                if not matches:
-                    continue
-
-                otp = re.sub(r"[^0-9]", "", matches[0])
-                svc = detect_service(sms)
-                country, flag, region_code = detect_country_and_flag(
-                    full_num, fallback_country
-                )
-                masked = mask_phone(full_num)
-
-                msg = build_otp_message(
-                    otp, svc, flag, country, region_code, masked
-                )
-                tg_send_otp(otp, msg)
-                cache_add(uid)
-
-                _log(
-                    "OTP",
-                    f"{svc['icon']} {svc['name']:<10}  {flag} {region_code}  "
-                    f"{masked}  →  {otp}",
-                    Fore.GREEN,
-                )
-                found = True
-
-            # Jeda antar cek nomor biar ramah server
-            time.sleep(1.0)
+                _log("NUM", f"akun #{acc['idx']}: {e}", Fore.YELLOW)
+            time.sleep(0.5)
 
     return found
-        
     
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
